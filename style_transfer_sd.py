@@ -1,37 +1,68 @@
 import argparse
+import os
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, UniPCMultistepScheduler
-from diffusers.utils import load_image
 
-#Generates edges for structure
 
-def get_canny_edges(image_path: str, size: tuple,
-                    low: int = 50, high: int = 150) -> Image.Image:
-
+def get_canny_edges(image_path, size, low=50, high=150):
     img   = cv2.imread(image_path)
-    img   = cv2.resize(img, size)  
+    img   = cv2.resize(img, size)
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, low, high)
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
 
 
-def get_output_size(image_path: str, max_dim: int = 512) -> tuple:
-
-    img    = Image.open(image_path)
+def get_output_size(image_path, max_dim=512):
+    img = Image.open(image_path)
     orig_w, orig_h = img.size
-    scale  = max_dim / max(orig_w, orig_h)
-    new_w  = (int(orig_w * scale) // 64) * 64
-    new_h  = (int(orig_h * scale) // 64) * 64
-    new_w  = max(new_w, 64)
-    new_h  = max(new_h, 64)
-    return new_w, new_h
+    scale = max_dim / max(orig_w, orig_h)
+    new_w = (int(orig_w * scale) // 64) * 64
+    new_h = (int(orig_h * scale) // 64) * 64
+    return max(new_w, 64), max(new_h, 64)
 
 
-def load_pipeline(device: str = "cuda"):
-   
+def decode_latent(pipe, latent):
+    """
+    Convert a latent tensor to a PIL image.
+    Used by the timelapse callback to visualise each denoising step.
+    The VAE decoder maps from latent space (4 channels) to pixel space (3 channels).
+    """
+    with torch.no_grad():
+        scaled = latent / pipe.vae.config.scaling_factor
+        decoded = pipe.vae.decode(scaled).sample
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+        decoded = decoded.cpu().permute(0, 2, 3, 1).numpy()
+        return Image.fromarray((decoded[0] * 255).astype(np.uint8))
+
+
+def make_timelapse_gif(frames_dir, output_path, fps=8):
+    """Combine saved step frames into an animated GIF."""
+    frames = sorted([
+        os.path.join(frames_dir, f)
+        for f in os.listdir(frames_dir)
+        if f.endswith(".png")
+    ])
+    if not frames:
+        print("No frames found for timelapse.")
+        return
+
+    images = [Image.open(f).convert("RGB") for f in frames]
+    duration = int(1000 / fps)
+
+    images[0].save(
+        output_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration,
+        loop=0,
+    )
+    print(f"Timelapse GIF saved → {output_path}  ({len(images)} frames)")
+
+
+def load_pipeline(device="cuda"):
     dtype = torch.float16 if device == "cuda" else torch.float32
 
     print("Loading ControlNet (canny)...")
@@ -42,7 +73,7 @@ def load_pipeline(device: str = "cuda"):
 
     print("Loading Stable Diffusion img2img pipeline...")
     pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
+        "Lykon/dreamshaper-8",
         controlnet=controlnet,
         torch_dtype=dtype,
         safety_checker=None,
@@ -63,24 +94,26 @@ def load_pipeline(device: str = "cuda"):
 
 
 def run(
-    content_path:      str,
-    style_path:        str,
-    output_path:       str   = "result.png",
-    resolution:        int   = 512,
-    controlnet_weight: float = 1.0,
-    ip_adapter_weight: float = 0.8,
-    denoise:           float = 0.75,
-    num_steps:         int   = 30,
-    seed:              int   = 42,
-    canny_low:         int   = 50,
-    canny_high:        int   = 150,
-    save_edges:        bool  = True,
+    content_path,
+    style_path,
+    output_path       = "result.png",
+    resolution        = 512,
+    controlnet_weight = 1.0,
+    ip_adapter_weight = 0.8,
+    denoise           = 0.75,
+    num_steps         = 30,
+    seed              = 42,
+    canny_low         = 50,
+    canny_high        = 150,
+    save_edges        = True,
+    timelapse         = False,
+    timelapse_fps     = 8,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     out_w, out_h = get_output_size(content_path, resolution)
-    print(f"\nContent image size → output size: {out_w}x{out_h}")
+    print(f"Output size: {out_w}x{out_h}")
 
     print(f"Extracting edges from {content_path}...")
     canny_image = get_canny_edges(content_path, (out_w, out_h), canny_low, canny_high)
@@ -95,16 +128,37 @@ def run(
     pipe = load_pipeline(device)
     pipe.set_ip_adapter_scale(ip_adapter_weight)
 
-    print(f"\nGenerating at {out_w}x{out_h}, {num_steps} steps...")
-    print(f"  ControlNet weight : {controlnet_weight}  (structure)")
-    print(f"  IP-Adapter weight : {ip_adapter_weight}  (style)")
-    print(f"  Denoise strength  : {denoise}  (higher = more style)")
+    print(f"Generating at {out_w}x{out_h}, {num_steps} steps...")
+    print(f"  ControlNet weight : {controlnet_weight}")
+    print(f"  IP-Adapter weight : {ip_adapter_weight}")
+    print(f"  Denoise strength  : {denoise}")
 
     generator = torch.Generator(device=device).manual_seed(seed)
 
+    frames_dir = None
+    callback   = None
+
+    if timelapse:
+        frames_dir = output_path.replace(".png", "_frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        print(f"  Timelapse frames → {frames_dir}/")
+
+        def callback(pipe, step, timestep, kwargs):
+            """
+            Called by diffusers after every denoising step.
+            Decodes the current latent to a pixel image and saves it.
+            This shows the image evolving from noise → final result.
+            """
+            latents = kwargs.get("latents")
+            if latents is not None:
+                frame = decode_latent(pipe, latents)
+                frame_path = os.path.join(frames_dir, f"step_{step:03d}.png")
+                frame.save(frame_path)
+            return kwargs
+
     result = pipe(
         prompt="",
-        negative_prompt="",
+        negative_prompt="hat, cap, headwear, blurry, deformed, ugly, bad anatomy, watermark, low quality",
         image=content_image,
         control_image=canny_image,
         ip_adapter_image=style_image,
@@ -112,10 +166,12 @@ def run(
         strength=denoise,
         controlnet_conditioning_scale=controlnet_weight,
         generator=generator,
+        callback_on_step_end=callback,
     ).images[0]
 
     result.save(output_path)
-    print(f"\nDone! Saved → {output_path}")
+    print(f" Done! Saved → {output_path}")
+
 
     comparison_path = output_path.replace(".png", "_comparison.png")
     comparison = Image.new("RGB", (out_w * 3, out_h))
@@ -125,37 +181,34 @@ def run(
     comparison.save(comparison_path)
     print(f"Comparison → {comparison_path}  (content | style | result)")
 
-    return result
 
+    if timelapse and frames_dir:
+        gif_path = output_path.replace(".png", "_timelapse.gif")
+        make_timelapse_gif(frames_dir, gif_path, timelapse_fps)
+
+    return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Style transfer: apply style of one image to another"
     )
-    parser.add_argument("--content",            required=True,
-                        help="Path to content image (your photo)")
-    parser.add_argument("--style",              required=True,
-                        help="Path to style image (painting/artwork)")
-    parser.add_argument("--output",             default="result.png",
-                        help="Output path (default: result.png)")
-    parser.add_argument("--resolution",         type=int,   default=512,
-                        help="Max dimension — aspect ratio is preserved")
-    parser.add_argument("--controlnet-weight",  type=float, default=1.0,
-                        help="Structure preservation (0.5-1.5)")
-    parser.add_argument("--ip-adapter-weight",  type=float, default=0.8,
-                        help="Style strength from image (0.3-1.0)")
-    parser.add_argument("--denoise",            type=float, default=0.75,
-                        help="0=no change, 1=full generation")
-    parser.add_argument("--steps",              type=int,   default=30,
-                        help="Diffusion steps (more = better, slower)")
-    parser.add_argument("--seed",               type=int,   default=42,
-                        help="Random seed — change for variations")
-    parser.add_argument("--canny-low",          type=int,   default=50,
-                        help="Lower = more edges captured")
+    parser.add_argument("--content",            required=True)
+    parser.add_argument("--style",              required=True)
+    parser.add_argument("--output",             default="result.png")
+    parser.add_argument("--resolution",         type=int,   default=512)
+    parser.add_argument("--controlnet-weight",  type=float, default=1.0)
+    parser.add_argument("--ip-adapter-weight",  type=float, default=0.8)
+    parser.add_argument("--denoise",            type=float, default=0.75)
+    parser.add_argument("--steps",              type=int,   default=30)
+    parser.add_argument("--seed",               type=int,   default=42)
+    parser.add_argument("--canny-low",          type=int,   default=50)
     parser.add_argument("--canny-high",         type=int,   default=150)
-    parser.add_argument("--no-save-edges",      action="store_true",
-                        help="Skip saving edge debug image")
+    parser.add_argument("--no-save-edges",      action="store_true")
+    parser.add_argument("--timelapse",          action="store_true",
+                        help="Save a frame at each step and combine into a GIF")
+    parser.add_argument("--timelapse-fps",      type=int,   default=8,
+                        help="GIF playback speed in frames per second (default 8)")
     args = parser.parse_args()
 
     run(
@@ -171,4 +224,6 @@ if __name__ == "__main__":
         canny_low         = args.canny_low,
         canny_high        = args.canny_high,
         save_edges        = not args.no_save_edges,
+        timelapse         = args.timelapse,
+        timelapse_fps     = args.timelapse_fps,
     )
